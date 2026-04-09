@@ -6,6 +6,7 @@ from pathlib import Path
 
 import tqdm
 from obstore.store import S3Store
+from stactools.met_office_deterministic.href import Href
 
 from . import azure
 from .check import Check
@@ -23,7 +24,7 @@ class Store:
             prefix=model.s3_prefix,
         )
         self.model = model
-        self.semaphore = Semaphore(10)
+        self.semaphore = Semaphore(50)
         self.queue = Queue()
 
     def get_reference_datetimes(self) -> list[datetime.datetime]:
@@ -50,32 +51,50 @@ class Store:
         self,
         reference_datetime: datetime.datetime,
         directory: Path,
-    ) -> Check | None:
+    ) -> list[Check]:
         async with self.semaphore:
             s3_paths = set(await self.get_s3_paths(reference_datetime))
         await self.queue.put(reference_datetime)
 
-        path_by_file_name = {p.rsplit("/", 1)[1]: p for p in s3_paths}
-        items = azure.get_items(directory, self.model, reference_datetime)
+        items = defaultdict(dict)
+        for item in azure.get_items(directory, self.model, reference_datetime):
+            items[item.collection_id][item.id] = item
         if not items:
-            return None
-        extra = defaultdict(lambda: defaultdict(list))
-        for item in items:
-            assert item.collection_id
-            for asset in item.assets.values():
-                file_name = asset.href.rsplit("/", 1)[1]
-                if file_name.endswith(".nc"):
-                    s3_path = path_by_file_name.get(file_name)
-                    if s3_path and s3_path in s3_paths:
-                        s3_paths.remove(s3_path)
-                    else:
-                        extra[item.collection_id][item.id].append(file_name)
-        return Check(
-            model=self.model,
-            reference_datetime=reference_datetime,
-            missing=sorted(s3_paths),
-            extra=dict(extra),
-        )
+            return []
+
+        checks: defaultdict[str, dict[str, Check]] = defaultdict(dict)
+        for s3_path in s3_paths:
+            href = Href.parse(s3_path)
+            item = items.get(href.collection_id, {}).get(href.item_id)
+            if href.item_id in checks[href.collection_id]:
+                check = checks[href.collection_id][href.item_id]
+            else:
+                check = Check(
+                    model=self.model,
+                    reference_datetime=reference_datetime,
+                    collection=href.collection_id,
+                    item=href.item_id,
+                    missing=[],
+                )
+                checks[href.collection_id][href.item_id] = check
+
+            if item:
+                check.has_item = True
+                missing = True
+                for asset in item.assets.values():
+                    if asset.href.rsplit("/", 1)[1] == s3_path.rsplit("/", 1)[1]:
+                        missing = False
+                        break
+                if missing:
+                    check.missing.append(s3_path)
+            else:
+                check.has_item = False
+                check.missing.append(s3_path)
+
+        checks_list = []
+        for item_checks in checks.values():
+            checks_list.extend(item_checks.values())
+        return checks_list
 
     async def check_all(self, directory: Path) -> list[Check]:
         reference_datetimes = self.get_reference_datetimes()
@@ -85,13 +104,10 @@ class Store:
                 task_group.create_task(self.check(reference_datetime, directory))
                 for reference_datetime in reference_datetimes
             ]
-        checks = list()
-        for task in tasks:
-            if check := task.result():
-                if not check.is_ok():
-                    checks.append(check)
         progress.cancel()
-        return checks
+
+        checks = [task.result() for task in tasks]
+        return [check for sublist in checks for check in sublist]
 
     async def progress(self, total: int) -> None:
         progress = tqdm.tqdm(total=total, desc="Checks")

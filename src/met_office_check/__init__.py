@@ -1,9 +1,6 @@
 import asyncio
 import datetime
-import json
 import urllib.parse
-from asyncio import TaskGroup
-from collections import defaultdict
 from pathlib import Path
 from typing import Annotated
 
@@ -13,7 +10,7 @@ from obstore.store import AzureStore
 from typer import Argument, Exit, Option, Typer
 
 from . import aws
-from .check import write_parquet
+from .check import write_checks_parquet, write_paths_parquet
 from .model import Model
 
 app = Typer()
@@ -36,9 +33,9 @@ def check_all(
     output: Annotated[
         Path,
         Argument(
-            help="The output parquet file. If not provided, defaults to check.parquet",
+            help="The output directory. If not provided, defaults to output",
         ),
-    ] = Path("check.parquet"),
+    ] = Path("output"),
 ) -> None:
     """Check all reference datetimes."""
     if not directory.exists():
@@ -47,11 +44,9 @@ def check_all(
 
     store = aws.Store(model)
     results = asyncio.run(store.check_all(directory))
-    if not results:
-        print("✅ Check ok!")
-    else:
-        write_parquet(results, output)
-        print(f"Output written to {output}")
+    write_checks_parquet(results, output / "checks.parquet")
+    write_paths_parquet(results, output / "paths.parquet")
+    print(f"Output written to {output}")
 
 
 @app.command()
@@ -80,9 +75,9 @@ def check(
     output: Annotated[
         Path,
         Argument(
-            help="The output parquet file. If not provided, defaults to check.parquet",
+            help="The output directory. If not provided, defaults to output",
         ),
-    ] = Path("check.parquet"),
+    ] = Path("output"),
 ) -> None:
     """Check a single reference datetime"""
     if not directory.exists():
@@ -96,17 +91,9 @@ def check(
 
     store = aws.Store(model)
     result = asyncio.run(store.check(reference_datetime, directory))
-    if not result:
-        print(f"⚠️  No STAC items found for model {model} at {reference_datetime}")
-    elif result.is_ok():
-        print("✅ Check ok!")
-    else:
-        if result.missing:
-            print(f"❌ {len(result.missing)} missing files")
-        if result.extra:
-            print(f"❌ {len(result.extra)} extra files")
-        write_parquet([result], output)
-        print(f"Output written to {output}")
+    write_paths_parquet(result, output / "paths.parquet")
+    write_checks_parquet(result, output / "checks.parquet")
+    print(f"Output written to {output}")
 
 
 @app.command()
